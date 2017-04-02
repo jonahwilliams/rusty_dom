@@ -1,0 +1,7 @@
+[package]
+name = "treediff"
+version = "0.1.0"
+authors = ["Jonah Williams <jonahwilliams@google.com>"]
+
+[dependencies]
+rustc-serialize = "0.3"
