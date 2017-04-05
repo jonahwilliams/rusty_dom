@@ -16,12 +16,13 @@ pub enum Element {
     Parent {
         key: Key,
         name: String,
+        keymap: BTreeMap<Key, usize>,
         attributes: Option<BTreeMap<String, String>>,
         children: Vec<Element>,
     },
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash, PartialOrd, Ord)]
 pub enum Key {
     Local(u64),
     Global(u64),
@@ -43,10 +44,11 @@ impl Clone for Element {
                     attributes: attributes.clone(),
                 }
             }
-            Parent { ref key, ref name, ref attributes, ref children } => {
+            Parent { ref key, ref name, ref attributes, ref children, ref keymap } => {
                 Parent {
                     key: *key,
                     name: name.clone(),
+                    keymap: keymap.clone(),
                     attributes: attributes.clone(),
                     children: children.clone(),
                 }
@@ -72,119 +74,87 @@ impl Element {
         }
     }
 
-    // Tries to add an elment to end of a list of children
-    pub fn append_child(&mut self, el: Element) -> Result<Change, DOMError> {
-        match *self {
-            Parent { ref mut children, .. } => {
-                children.push(el.clone());
-                Ok(Change::AppendChild(el))
-            }
-            _ => Err(DOMError::ChildlessElementOpError),
-        }
-    }
-
-    // Tries to insert an element before the index
-    pub fn insert_before(&mut self, index: usize, el: Element) -> Result<Change, DOMError> {
-        match *self {
-            Parent { ref mut children, .. } => {
-                if index < children.len() {
-                    let el_ref = children[index].to_key();
-                    children.insert(index, el.clone());
-                    Ok(Change::InsertBefore(el_ref, el))
+    pub fn diff(&self, other: &Element) -> Option<DiffTree> {
+        match (self, other) {
+            (&Text { value: ref left, .. }, &Text { value: ref right, .. }) => {
+                if left != right {
+                    Some(DiffTree {
+                        changes: Some(Box::new([Change::UpdateText(right.to_string())])),
+                        children: None,
+                    })
                 } else {
-                    Err(DOMError::IndexOOBError)
+                    None
                 }
             }
-            _ => Err(DOMError::ChildlessElementOpError),
-        }
-    }
+            (&Void { name: ref left, .. }, &Void { name: ref right, .. }) => {
+                if left == right {
+                    None
+                } else {
+                    Some(DiffTree {
+                        changes: Some(Box::new([Change::ReplaceNode(other.clone())])),
+                        children: None,
+                    })
+                }
+            }
+            (&Parent { name: ref left,
+                       children: ref left_children,
+                       keymap: ref left_keymap,
+                       .. },
+             &Parent { name: ref right,
+                       children: ref right_children,
+                       keymap: ref right_keymap,
+                       .. }) if left == right => {
+                let mut changes = vec![];
+                let mut child_changes = vec![];
+                let mut order = false;
 
-    // Tries to insert all elements before the index, in order
-    pub fn insert_all(&mut self, index: usize, els: Vec<Element>) -> Result<Change, DOMError> {
-        match *self {
-            Parent { ref mut children, .. } => {
-                if index < children.len() {
-                    let el_ref = children[index].to_key();
-                    let mut i = index;
-                    for el in els.iter() {
-                        children.insert(i, el.clone());
-                        i += 1;
+                for (&key, &value) in left_keymap.iter() {
+                    if let Some(&value_) = right_keymap.get(&key) {
+                        if value != value_ {
+                            order = true;
+                        }
+                        if let Some(child_tree) = left_children[value]
+                            .diff(&right_children[value_]) {
+                            child_changes.push((key, child_tree));
+                        }
+                    } else {
+                        changes.push(Change::RemoveChild(key));
                     }
-                    Ok(Change::InsertAll(el_ref, els.into_boxed_slice()))
+                }
+                for (key, &value) in right_keymap.iter() {
+                    if let Some(&value_) = left_keymap.get(&key) {
+                        if value != value_ {
+                            order = true;
+                        }
+                    } else {
+                        changes.push(Change::InsertChild(right_children[value].clone()));
+                    }
+                }
+                if order {
+                    let keys: Vec<Key> = right_children.iter()
+                        .map(|x| x.to_key())
+                        .collect();
+                    changes.push(Change::SortChildren(keys.into_boxed_slice()));
+                }
+
+                if child_changes.len() == 0 {
+                    Some(DiffTree {
+                        changes: Some(changes.into_boxed_slice()),
+                        children: None,
+                    })
                 } else {
-                    Err(DOMError::IndexOOBError)
+                    Some(DiffTree {
+                        changes: Some(changes.into_boxed_slice()),
+                        children: Some(child_changes.into_boxed_slice()),
+                    })
                 }
             }
-            _ => Err(DOMError::ChildlessElementOpError),
-        }
-    }
-
-    // Tries to append all elements to the end of a list of children
-    pub fn append_all(&mut self, els: Vec<Element>) -> Result<Change, DOMError> {
-        match *self {
-            Parent { ref mut children, .. } => {
-                for el in els.iter() {
-                    children.push(el.clone());
-                }
-                Ok(Change::AppendAll(els.into_boxed_slice()))
+            _ => {
+                Some(DiffTree {
+                    changes: Some(Box::new([Change::ReplaceNode(other.clone())])),
+                    children: None,
+                })
             }
-            _ => Err(DOMError::ChildlessElementOpError),
-        }
-    }
-
-    // Replaces the nth child with a new element
-    pub fn replace_child(&mut self, index: usize, el: Element) -> Result<Change, DOMError> {
-        match *self {
-            Parent { ref mut children, .. } => {
-                if index < children.len() {
-                    children.push(el.clone());
-                    let old = children.swap_remove(index);
-                    Ok(Change::ReplaceChild(old.to_key(), el))
-                } else {
-                    Err(DOMError::IndexOOBError)
-                }
-            }
-            _ => Err(DOMError::ChildlessElementOpError),
-        }
-    }
-
-    // Removes the nth child
-    pub fn remove_child(&mut self, index: usize) -> Result<Change, DOMError> {
-        match *self {
-            Parent { ref mut children, .. } => {
-                if index < children.len() {
-                    let old = children.remove(index);
-                    Ok(Change::RemoveChild(old.to_key()))
-                } else {
-                    Err(DOMError::IndexOOBError)
-                }
-            }
-            _ => Err(DOMError::ChildlessElementOpError),
-        }
-    }
-
-    // Computes a new ordering of children based on the provided comparison function
-    pub fn reorder_children<'a, B: Ord>(&mut self,
-                                        cmp: &'a Fn(&Element) -> B)
-                                        -> Result<Change, DOMError> {
-        match *self {
-            Parent { ref mut children, .. } => {
-                children.sort_by_key(cmp);
-                let keys: Vec<Key> = children.iter().map(|el| el.to_key()).collect();
-                Ok(Change::ReorderChildren(keys.into_boxed_slice()))
-            }
-            _ => Err(DOMError::ChildlessElementOpError),
-        }
-    }
-
-    pub fn update_text<'a>(&mut self, new: &'a str) -> Result<Change, DOMError> {
-        match *self {
-            Text { ref mut value, .. } => {
-                value.clear();
-                value.push_str(new);
-                Ok(Change::UpdateText(new.to_string()))
-            }
-            _ => Err(DOMError::NotATextNode),
         }
     }
 }
@@ -266,94 +236,59 @@ enum Event {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct DiffTree {
-    cost: u64,
     changes: Option<Box<[Change]>>,
     children: Option<Box<[(Key, DiffTree)]>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Change {
-    AppendChild(Element),
-    AppendAll(Box<[Element]>),
-    InsertBefore(Key, Element),
-    InsertAll(Key, Box<[Element]>),
-    ReplaceChild(Key, Element),
     RemoveChild(Key),
-    ReorderChildren(Box<[Key]>),
+    InsertChild(Element),
+    SortChildren(Box<[Key]>),
     UpdateText(String),
+    ReplaceNode(Element),
 }
-
-// Common DOM manipulation errors
-pub enum DOMError {
-    ChildlessElementOpError,
-    IndexOOBError,
-    NotATextNode,
-}
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn element_eq(left: &Element, right: &Element) {
-        match (left, right) {
-            (&Element::Text { ref value, .. }, &Element::Text { value: ref value_, .. }) => {
-                assert!(value == value_,
-                        "Element::Text does not match\nExpected {}, found {}",
-                        value,
-                        value_);
-            }
-            (&Element::Void { ref name, .. }, &Element::Void { name: ref name_, .. }) => {
-                assert!(name == name_,
-                        "Element::Void does not match\nExpected type {}, found {}",
-                        name,
-                        name_);
-            }
-            (&Element::Parent { ref name, ref children, .. },
-             &Element::Parent { name: ref name_, children: ref children_, .. }) => {
-                assert!(name == name_,
-                        "Element::Parent does not match\nExpected type {}, found {}",
-                        name,
-                        name_);
-                if children.len() != children_.len() {
-                    assert!(false,
-                            "Element::Parent have different numbers of children\nExpected {}, \
-                             found {}",
-                            children.len(),
-                            children_.len());
-                }
-                for (left, right) in children.into_iter().zip(children_.into_iter()) {
-                    element_eq(left, right);
-                }
-            }
-            _ => {
-                assert!(false, "Element types do not match");
-            }
-        }
-    }
-
     macro_rules! el {
-        ($name:ident[]) => (
+        ($name:ident[key=$value:expr]) => (
             {
-                Element::Parent{
-                    key: Key::Local(0),
+                Element::Void{
+                    key: Key::Local($value),
                     name: stringify!($name).to_string(),
                     attributes: None,
-                    children: vec![],
                 }
             }
         );
-        ($name:ident[[$($child:expr),* ]]) => (
+        ($name:ident[]) => (
             {
-                let mut children = vec![];
-                $(
-                    children.push($child);
-                )*
-                Element::Parent{
+                Element::Void{
                     key: Key::Local(0),
                     name: stringify!($name).to_string(),
+                    attributes: None,
+                }
+            }
+        );
+        ($name:ident[key=$value:expr, $($child:expr),* ]) => (
+            {
+                let mut children = vec![];
+                let mut keymap = BTreeMap::new();
+                let mut index = 0;
+                $(
+                    children.push($child);
+                    keymap.insert($child.to_key(), index);
+                    index += 1;
+                )*
+
+                Element::Parent{
+                    key: Key::Local($value),
+                    name: stringify!($name).to_string(),
+                    keymap: keymap,
                     attributes: None,
                     children: children,
                 }
@@ -362,10 +297,110 @@ mod tests {
     }
 
     #[test]
-    fn test_append_child() {
-        let mut el = el!(div[]);
-        let changes = el.append_child(el!(hr[]));
-        assert!(changes.is_ok());
-        element_eq(&el, &el!(div[[el!(hr[])]]));
+    fn test_remove_single() {
+        let left = el!(div[
+            key=0,
+            el!(div[key=1]),
+            el!(div[key=2]),
+            el!(div[key=3])
+        ]);
+        let right = el!(div[
+            key=0,
+            el!(div[key=1]),
+            el!(div[key=2])
+        ]);
+        let diff = left.diff(&right);
+
+        assert_eq!(diff, Some(DiffTree{
+            changes: Some(vec![
+                Change::RemoveChild(Key::Local(3)),
+            ].into_boxed_slice()),
+            children: None,
+        }));
     }
+
+    #[test]
+    fn test_remove_many() {
+        let left = el!(div[
+            key=0,
+            el!(div[key=1]),
+            el!(div[key=2]),
+            el!(div[key=3])
+        ]);
+
+        let right = el!(div[
+            key=0,
+            el!(div[key=1])
+        ]);
+        let diff = left.diff(&right);
+
+        assert_eq!(diff, Some(DiffTree{
+            changes: Some(vec![
+                Change::RemoveChild(Key::Local(2)),
+                Change::RemoveChild(Key::Local(3)),
+            ].into_boxed_slice()),
+            children: None,
+        }));
+    }
+
+    #[test]
+    fn test_nested_remove() {
+        let left = el!(div[
+            key=0,
+            el!(div[
+                key=0,
+                el!(div[])
+            ])
+        ]);
+
+        let right = el!(div[
+            key=0,
+            el!(div[])
+        ]);
+
+        let diff = left.diff(&right);
+
+        assert_eq!(diff, Some(DiffTree{
+            changes: None,
+            children: Some(vec![
+                (Key::Local(0), DiffTree{
+                    changes: Some(vec![
+                        Change::ReplaceNode(el!(div[]))
+                    ].into_boxed_slice()),
+                    children: None,
+                })
+            ].into_boxed_slice()),
+        }));
+    }
+
+    #[test]
+    fn test_insert_single() {
+        let left = el!(div[
+            key=0,
+            el!(div[key=1]),
+            el!(div[key=2])
+        ]);
+
+        let right = el!(div[
+            key=0,
+            el!(div[key=0]),
+            el!(div[key=1]),
+            el!(div[key=2])
+        ]);
+
+        let diff = left.diff(&right);
+
+        assert_eq!(diff, Some(DiffTree{
+            changes: Some(vec![
+                Change::InsertChild(el!(div[key=0])),
+                Change::SortChildren(vec![
+                    Key::Local(0),
+                    Key::Local(1),
+                    Key::Local(2),
+                ].into_boxed_slice()),
+            ].into_boxed_slice()),
+            children: None,
+        }));
+    }
+
 }
