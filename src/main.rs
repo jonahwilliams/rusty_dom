@@ -1,339 +1,371 @@
-extern crate rustc_serialize;
-
+#![allow(dead_code)]
 use std::collections::BTreeMap;
-use rustc_serialize::json::{self, Json, ToJson};
-use std::fmt;
-
+use Element::*;
 
 fn main() {}
 
+// Represents an HTML element.
 #[derive(Debug)]
-pub struct Element {
-    name: String,
-    attributes: BTreeMap<String, String>,
-    keys: BTreeMap<u32, usize>,
-    children: Vec<Element>,
+pub enum Element {
+    Text { key: Key, value: String },
+    Void {
+        key: Key,
+        name: String,
+        attributes: Option<BTreeMap<String, String>>,
+    },
+    Parent {
+        key: Key,
+        name: String,
+        attributes: Option<BTreeMap<String, String>>,
+        children: Vec<Element>,
+    },
 }
 
-// String value representation for Element
-impl fmt::Display for Element {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "<{}", self.name);
-        for (key, value) in self.attributes.iter() {
-            write!(f, " {}={}", key, value);
-        }
-        write!(f, ">");
-        for el in self.children.iter() {
-            write!(f, "\n{}", el);
-        }
-        write!(f, "</{}>", self.name)
-    }
-}
-
-// JSON value representation for Element
-impl ToJson for Element {
-    fn to_json(&self) -> Json {
-        let mut res = BTreeMap::new();
-        let mut children = Vec::new();
-        for child in self.children.iter() {
-            children.push(child.to_json());
-        }
-        res.insert("name".to_string(), self.name.to_json());
-        res.insert("attributes".to_string(), self.attributes.clone().to_json());
-        res.insert("children".to_string(), children.to_json());
-        Json::Object(res)
-    }
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Key {
+    Local(u64),
+    Global(u64),
 }
 
 impl Clone for Element {
     fn clone(&self) -> Element {
-        Element {
-            name: self.name.clone(),
-            keys: self.keys.clone(),
-            attributes: self.attributes.clone(),
-            children: self.children.clone(),
+        match *self {
+            Text { ref key, ref value } => {
+                Text {
+                    key: *key,
+                    value: value.clone(),
+                }
+            }
+            Void { ref key, ref name, ref attributes } => {
+                Void {
+                    key: *key,
+                    name: name.clone(),
+                    attributes: attributes.clone(),
+                }
+            }
+            Parent { ref key, ref name, ref attributes, ref children } => {
+                Parent {
+                    key: *key,
+                    name: name.clone(),
+                    attributes: attributes.clone(),
+                    children: children.clone(),
+                }
+            }
         }
     }
 }
 
-// This should only be used for testing/debugging purposes
+// Fast equality checks are implemented by comparing references, not values
 impl PartialEq for Element {
     fn eq(&self, other: &Element) -> bool {
-        self.name == other.name && self.children.len() == other.children.len() &&
-        self.children
-            .iter()
-            .zip(other.children.iter())
-            .all(|(left, right)| left == right) &&
-        self.attributes.len() == other.attributes.len() &&
-        self.attributes
-            .iter()
-            .all(|(key, value)| {
-                if let Some(value_) = other.attributes.get(key) {
-                    value == value_
-                } else {
-                    false
-                }
-            })
+        self.to_key() == other.to_key()
     }
 }
 
 impl Element {
-    // Creates a new Element
-    pub fn new<'a>(name: &'a str) -> Element {
-        Element {
-            name: name.to_string(),
-            attributes: BTreeMap::new(),
-            keys: BTreeMap::new(),
-            children: Vec::new(),
-        }
-    }
-    // Appends a child to the existing Element
-    pub fn add_child(&mut self, key: u32, child: Element) {
-        let idx = self.children.len();
-        self.keys.insert(key, idx);
-        self.children.push(child);
-    }
-
-    pub fn add_attr<'a>(&mut self, name: &'a str, value: &'a str) {
-        self.attributes.insert(name.to_string(), value.to_string());
-    }
-
-    // Performs a diff of the children of two trees
-    pub fn child_diff(&self, other: &Element, level: usize) -> DiffTree {
-        use ChildChange::*;
-        let mut nested: BTreeMap<usize, DiffTree> = BTreeMap::new();
-        let mut changes: Vec<ChildChange> = Vec::new();
-
-        for (key, &value) in self.keys.iter() {
-            if let Some(&value_) = other.keys.get(key) {
-                if value != value_ {
-                    changes.push(SwapChild(value, value_));
-                }
-                let ref left = self.children[value];
-                let ref right = other.children[value_];
-                let diff = left.child_diff(right, level + 1);
-                if diff.has_changes() {
-                    nested.insert(value, diff);
-                }
-            } else {
-                changes.push(RemoveChild(value));
-            }
-        }
-
-        for (key, &value) in other.keys.iter() {
-            if !self.keys.contains_key(key) {
-                let ref right = other.children[value];
-                changes.push(InsertChild(value, right.clone()));
-            }
-        }
-
-        DiffTree {
-            level: level,
-            name: self.name.clone(),
-            attr_changes: Element::attr_diff(&self.attributes, &other.attributes),
-            child_changes: changes,
-            nested: nested,
-        }
-    }
-
-    // TODO
     #[inline(always)]
-    fn attr_diff(left: &BTreeMap<String, String>,
-                 right: &BTreeMap<String, String>)
-                 -> Vec<ChildChange> {
-        vec![]
+    pub fn to_key(&self) -> Key {
+        match *self {
+            Text { key, .. } => key,
+            Void { key, .. } => key,
+            Parent { key, .. } => key,
+        }
+    }
+
+    // Tries to add an elment to end of a list of children
+    pub fn append_child(&mut self, el: Element) -> Result<Change, DOMError> {
+        match *self {
+            Parent { ref mut children, .. } => {
+                children.push(el.clone());
+                Ok(Change::AppendChild(el))
+            }
+            _ => Err(DOMError::ChildlessElementOpError),
+        }
+    }
+
+    // Tries to insert an element before the index
+    pub fn insert_before(&mut self, index: usize, el: Element) -> Result<Change, DOMError> {
+        match *self {
+            Parent { ref mut children, .. } => {
+                if index < children.len() {
+                    let el_ref = children[index].to_key();
+                    children.insert(index, el.clone());
+                    Ok(Change::InsertBefore(el_ref, el))
+                } else {
+                    Err(DOMError::IndexOOBError)
+                }
+            }
+            _ => Err(DOMError::ChildlessElementOpError),
+        }
+    }
+
+    // Tries to insert all elements before the index, in order
+    pub fn insert_all(&mut self, index: usize, els: Vec<Element>) -> Result<Change, DOMError> {
+        match *self {
+            Parent { ref mut children, .. } => {
+                if index < children.len() {
+                    let el_ref = children[index].to_key();
+                    let mut i = index;
+                    for el in els.iter() {
+                        children.insert(i, el.clone());
+                        i += 1;
+                    }
+                    Ok(Change::InsertAll(el_ref, els.into_boxed_slice()))
+                } else {
+                    Err(DOMError::IndexOOBError)
+                }
+            }
+            _ => Err(DOMError::ChildlessElementOpError),
+        }
+    }
+
+    // Tries to append all elements to the end of a list of children
+    pub fn append_all(&mut self, els: Vec<Element>) -> Result<Change, DOMError> {
+        match *self {
+            Parent { ref mut children, .. } => {
+                for el in els.iter() {
+                    children.push(el.clone());
+                }
+                Ok(Change::AppendAll(els.into_boxed_slice()))
+            }
+            _ => Err(DOMError::ChildlessElementOpError),
+        }
+    }
+
+    // Replaces the nth child with a new element
+    pub fn replace_child(&mut self, index: usize, el: Element) -> Result<Change, DOMError> {
+        match *self {
+            Parent { ref mut children, .. } => {
+                if index < children.len() {
+                    children.push(el.clone());
+                    let old = children.swap_remove(index);
+                    Ok(Change::ReplaceChild(old.to_key(), el))
+                } else {
+                    Err(DOMError::IndexOOBError)
+                }
+            }
+            _ => Err(DOMError::ChildlessElementOpError),
+        }
+    }
+
+    // Removes the nth child
+    pub fn remove_child(&mut self, index: usize) -> Result<Change, DOMError> {
+        match *self {
+            Parent { ref mut children, .. } => {
+                if index < children.len() {
+                    let old = children.remove(index);
+                    Ok(Change::RemoveChild(old.to_key()))
+                } else {
+                    Err(DOMError::IndexOOBError)
+                }
+            }
+            _ => Err(DOMError::ChildlessElementOpError),
+        }
+    }
+
+    // Computes a new ordering of children based on the provided comparison function
+    pub fn reorder_children<'a, B: Ord>(&mut self,
+                                        cmp: &'a Fn(&Element) -> B)
+                                        -> Result<Change, DOMError> {
+        match *self {
+            Parent { ref mut children, .. } => {
+                children.sort_by_key(cmp);
+                let keys: Vec<Key> = children.iter().map(|el| el.to_key()).collect();
+                Ok(Change::ReorderChildren(keys.into_boxed_slice()))
+            }
+            _ => Err(DOMError::ChildlessElementOpError),
+        }
+    }
+
+    pub fn update_text<'a>(&mut self, new: &'a str) -> Result<Change, DOMError> {
+        match *self {
+            Text { ref mut value, .. } => {
+                value.clear();
+                value.push_str(new);
+                Ok(Change::UpdateText(new.to_string()))
+            }
+            _ => Err(DOMError::NotATextNode),
+        }
     }
 }
 
-// A DiffTree reprents a serializable change that needs to made
-// at a single level of DOM.
+#[derive(Debug)]
+enum Event {
+    Click {
+        bubbles: bool,
+        cancelable: bool,
+        target: Key,
+        screen_x: f64,
+        screeny_y: f64,
+    },
+    DoubleClick {
+        bubbles: bool,
+        cancelable: bool,
+        target: Key,
+        screen_x: f64,
+        screen_y: f64,
+    },
+    MouseDown {
+        bubbles: bool,
+        cancelable: bool,
+        target: Key,
+    },
+    MouseEnter {
+        bubbles: bool,
+        cancelable: bool,
+        target: Key,
+    },
+    MouseLeave {
+        bubbles: bool,
+        cancelable: bool,
+        target: Key,
+    },
+    MouseMove {
+        bubbles: bool,
+        cancelable: bool,
+        target: Key,
+    },
+    MouseOut {
+        bubbles: bool,
+        cancelable: bool,
+        target: Key,
+    },
+    MouseUp {
+        bubbles: bool,
+        cancelable: bool,
+        target: Key,
+    },
+    KeyDown {
+        bubbles: bool,
+        cancelable: bool,
+        target: Key,
+        char_code: u32,
+    },
+    KeyPress {
+        bubbles: bool,
+        cancelable: bool,
+        target: Key,
+        char_code: u32,
+    },
+    KeyUp {
+        bubbles: bool,
+        cancelable: bool,
+        target: Key,
+        char_code: u32,
+    },
+    ContextMenu {
+        bubbles: bool,
+        cancelable: bool,
+        target: Key,
+    },
+    Change {
+        bubbles: bool,
+        cancelable: bool,
+        target: Key,
+        value: String,
+    },
+}
+
 #[derive(Debug)]
 pub struct DiffTree {
-    level: usize,
-    name: String,
-    attr_changes: Vec<ChildChange>,
-    child_changes: Vec<ChildChange>,
-    nested: BTreeMap<usize, DiffTree>,
+    cost: u64,
+    changes: Option<Box<[Change]>>,
+    children: Option<Box<[(Key, DiffTree)]>>,
 }
 
-impl DiffTree {
-    fn consume_to_json(self) -> Json {
-        let mut res = BTreeMap::new();
-        let empty: Vec<String> = Vec::new();
-        res.insert("level".to_string(), self.level.to_json());
-        res.insert("name".to_string(), self.name.to_json());
-        res.insert("attr_changes".to_string(), empty.to_json());
-        let values: Vec<Json> = self.child_changes
-            .into_iter()
-            .map(|x| x.consume_to_json())
-            .collect();
-        res.insert("child_changes".to_string(), values.to_json());
-        Json::Object(res)
-    }
-
-    // Are there any actual changes in this structure>
-    fn has_changes(&self) -> bool {
-        self.attr_changes.len() != 0 ||
-        self.child_changes.len() != 0 ||
-        self.nested.len() != 0
-    }
-}
-
-// This should only be used for testing/debugging purposes
-impl PartialEq for DiffTree {
-    fn eq(&self, other: &DiffTree) -> bool {
-        self.level == other.level && self.name == other.name &&
-        self.child_changes.len() == other.child_changes.len() &&
-        self.child_changes
-            .iter()
-            .zip(other.child_changes.iter())
-            .all(|(left, right)| left == right) &&
-        self.attr_changes.len() == other.attr_changes.len() &&
-        self.attr_changes
-            .iter()
-            .zip(other.attr_changes.iter())
-            .all(|(left, right)| left == right) &&
-        self.nested.len() == other.nested.len() &&
-        self.nested
-            .keys()
-            .all(|key| {
-                let value = self.nested.get(key).unwrap();
-                if let Some(value_) = other.nested.get(key) {
-                    value == value_
-                } else {
-                    false
-                }
-            })
-
-    }
-}
-
-// A Change is an atomic action performed as part of a tree diff.
 #[derive(Debug)]
-pub enum ChildChange {
-    // Insert a new child at the given index.
-    InsertChild(usize, Element),
-    // Remove a child at the given index.
-    RemoveChild(usize),
-    // Swap the elements at the given indexes.
-    SwapChild(usize, usize),
+pub enum Change {
+    AppendChild(Element),
+    AppendAll(Box<[Element]>),
+    InsertBefore(Key, Element),
+    InsertAll(Key, Box<[Element]>),
+    ReplaceChild(Key, Element),
+    RemoveChild(Key),
+    ReorderChildren(Box<[Key]>),
+    UpdateText(String),
 }
 
-impl ChildChange {
-    fn consume_to_json(self) -> Json {
-        use ChildChange::*;
-        let mut res = BTreeMap::new();
-        match self {
-            InsertChild(idx, node) => {
-                res.insert("kind".to_string(), "insert".to_json());
-                res.insert("index".to_string(), idx.to_json());
-                res.insert("value".to_string(), node.to_json());
-            }
-            RemoveChild(idx) => {
-                res.insert("kind".to_string(), "remove".to_json());
-                res.insert("index".to_string(), idx.to_json());
-            }
-            SwapChild(idx, idx_) => {
-                res.insert("kind".to_string(), "swap".to_json());
-                res.insert("value_left".to_string(), idx.to_json());
-                res.insert("value_right".to_string(), idx_.to_json());
-            }
-        }
-        Json::Object(res)
-    }
+// Common DOM manipulation errors
+pub enum DOMError {
+    ChildlessElementOpError,
+    IndexOOBError,
+    NotATextNode,
 }
-
-impl PartialEq for ChildChange {
-    fn eq(&self, other: &ChildChange) -> bool {
-        use ChildChange::*;
-        match (self, other) {
-            (&SwapChild(idx, idx2), &SwapChild(idx_, idx2_)) => idx == idx_ && idx2 == idx2_,
-            (&RemoveChild(idx), &RemoveChild(idx_)) => idx == idx_,
-            (&InsertChild(idx, ref node), &InsertChild(idx_, ref node_)) => {
-                idx == idx_ && node == node_
-            }
-            _ => false,
-        }
-    }
-}
-
 
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[macro_export]
-    macro_rules! map(
-        { $($key:expr => $value:expr),* } => {
-            {
-            let mut m = BTreeMap::new();
-            $(
-                m.insert($key, $value);
-            )*
-            m
+    fn element_eq(left: &Element, right: &Element) {
+        match (left, right) {
+            (&Element::Text { ref value, .. }, &Element::Text { value: ref value_, .. }) => {
+                assert!(value == value_,
+                        "Element::Text does not match\nExpected {}, found {}",
+                        value,
+                        value_);
             }
-        };
-    );
+            (&Element::Void { ref name, .. }, &Element::Void { name: ref name_, .. }) => {
+                assert!(name == name_,
+                        "Element::Void does not match\nExpected type {}, found {}",
+                        name,
+                        name_);
+            }
+            (&Element::Parent { ref name, ref children, .. },
+             &Element::Parent { name: ref name_, children: ref children_, .. }) => {
+                assert!(name == name_,
+                        "Element::Parent does not match\nExpected type {}, found {}",
+                        name,
+                        name_);
+                if children.len() != children_.len() {
+                    assert!(false,
+                            "Element::Parent have different numbers of children\nExpected {}, \
+                             found {}",
+                            children.len(),
+                            children_.len());
+                }
+                for (left, right) in children.into_iter().zip(children_.into_iter()) {
+                    element_eq(left, right);
+                }
+            }
+            _ => {
+                assert!(false, "Element types do not match");
+            }
+        }
+    }
 
-    #[test]
-    fn finds_differences() {
-        let mut tree_1 = Element::new("root");
-        tree_1.add_child(0, Element::new("div"));
-        tree_1.add_child(1, Element::new("h1"));
-
-        let mut tree_2 = Element::new("root");
-        tree_2.add_child(1, Element::new("h1"));
-        tree_2.add_child(0, Element::new("div"));
-
-        let diff = tree_1.child_diff(&tree_2, 0);
-
-        assert_eq!(diff,
-                   DiffTree {
-                       level: 0,
-                       name: "root".to_string(),
-                       attr_changes: vec![],
-                       nested: map!{},
-                       child_changes: vec![
-                           ChildChange::SwapChild(0, 1),
-                           ChildChange::SwapChild(1, 0),
-                        ],
-                   });
+    macro_rules! el {
+        ($name:ident[]) => (
+            {
+                Element::Parent{
+                    key: Key::Local(0),
+                    name: stringify!($name).to_string(),
+                    attributes: None,
+                    children: vec![],
+                }
+            }
+        );
+        ($name:ident[[$($child:expr),* ]]) => (
+            {
+                let mut children = vec![];
+                $(
+                    children.push($child);
+                )*
+                Element::Parent{
+                    key: Key::Local(0),
+                    name: stringify!($name).to_string(),
+                    attributes: None,
+                    children: children,
+                }
+            }
+        );
     }
 
     #[test]
-    fn finds_nested_differences() {
-        let mut tree_1 = Element::new("root");
-        let mut leaf_1 =  Element::new("div");
-        leaf_1.add_child(0, Element::new("br"));
-        tree_1.add_child(0, leaf_1);
-        tree_1.add_child(1, Element::new("h1"));
-
-        let mut tree_2 = Element::new("root");
-        tree_2.add_child(1, Element::new("h1"));
-        tree_2.add_child(0, Element::new("div"));
-
-        let diff = tree_1.child_diff(&tree_2, 0);
-        assert_eq!(diff,
-                   DiffTree{
-                       level: 0,
-                       name: "root".to_string(),
-                       attr_changes: vec![],
-                       child_changes: vec![
-                         ChildChange::SwapChild(0, 1),
-                         ChildChange::SwapChild(1, 0),
-                       ],
-                       nested: map!{
-                           0 => DiffTree{
-                               level: 1,
-                               name: "div".to_string(),
-                               attr_changes: vec![],
-                               nested: map!{},
-                               child_changes: vec![
-                                   ChildChange::RemoveChild(0),
-                               ]
-                           }
-                       },
-                   });
+    fn test_append_child() {
+        let mut el = el!(div[]);
+        let changes = el.append_child(el!(hr[]));
+        assert!(changes.is_ok());
+        element_eq(&el, &el!(div[[el!(hr[])]]));
     }
 }
